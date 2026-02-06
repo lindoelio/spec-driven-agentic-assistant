@@ -8,7 +8,11 @@
 import type { IEnginePort, Checkpoint, FileReference } from '../ports/outbound/IEnginePort.js';
 import type { IFileSystemPort } from '../ports/outbound/IFileSystemPort.js';
 import type { Task } from '../domain/Task.js';
-import type { SteeringDocs } from '../domain/Steering.js';
+import type { GuidelinesDocs } from '../domain/Guidelines.js';
+import { loadAgentSkillTemplateByType } from '../lib/ResourceLoader.js';
+
+/** Skill path for the task implementer skill file */
+const TASK_IMPLEMENTER_SKILL_PATH = '.spec/skills/spec-driven-task-implementer/SKILL.md';
 
 export interface SpecBuilderDependencies {
     engine: IEnginePort;
@@ -18,7 +22,7 @@ export interface SpecBuilderDependencies {
 export interface ImplementationContext {
     requirements: string;
     design: string;
-    steering: SteeringDocs;
+    guidelines: GuidelinesDocs;
     targetFileContents?: FileReference[];
     relatedTasks?: Task[];
     projectDocs?: Record<string, string>;
@@ -55,7 +59,7 @@ const DEFAULT_OPTIONS: BuilderOptions = {
  * SpecBuilder handles code generation from tasks.
  *
  * The Builder agent:
- * - Loads all relevant context (design, requirements, steering, memory)
+ * - Loads all relevant context (design, requirements, guidelines, memory)
  * - Injects target file contents for modification
  * - Generates implementation via engine
  * - Validates and saves checkpoint
@@ -75,7 +79,7 @@ export class SpecBuilder {
         baseContext: {
             requirements: string;
             design: string;
-            steering: SteeringDocs;
+            guidelines: GuidelinesDocs;
             projectDocs?: Record<string, string>;
         },
         options: BuilderOptions = {}
@@ -92,12 +96,15 @@ export class SpecBuilder {
             // Build and execute the implementation prompt
             const prompt = this.buildImplementationPrompt(task, context, checkpoint);
 
+            // Get system prompt from skill file
+            const systemPrompt = await this.getSystemPrompt(task);
+
             const result = await this.deps.engine.prompt(
-                { type: 'implementation', systemPrompt: this.getSystemPrompt(task) },
+                { type: 'implementation', systemPrompt },
                 {
                     specId: task.specId,
                     files: context.targetFileContents,
-                    steering: context.steering,
+                    guidelines: context.guidelines,
                     memory: checkpoint?.decisions,
                     history: [{ role: 'user', content: prompt }],
                 }
@@ -129,7 +136,7 @@ export class SpecBuilder {
         baseContext: {
             requirements: string;
             design: string;
-            steering: SteeringDocs;
+            guidelines: GuidelinesDocs;
             projectDocs?: Record<string, string>;
         },
         options: BuilderOptions = {}
@@ -139,13 +146,16 @@ export class SpecBuilder {
         const checkpoint = await this.deps.engine.loadCheckpoint(task.specId);
         const prompt = this.buildImplementationPrompt(task, context, checkpoint);
 
+        // Get system prompt from skill file
+        const systemPrompt = await this.getSystemPrompt(task);
+
         let fullOutput = '';
         const stream = this.deps.engine.streamPrompt(
-            { type: 'implementation', systemPrompt: this.getSystemPrompt(task) },
+            { type: 'implementation', systemPrompt },
             {
                 specId: task.specId,
                 files: context.targetFileContents,
-                steering: context.steering,
+                guidelines: context.guidelines,
                 memory: checkpoint?.decisions,
                 history: [{ role: 'user', content: prompt }],
             }
@@ -169,7 +179,7 @@ export class SpecBuilder {
         baseContext: {
             requirements: string;
             design: string;
-            steering: SteeringDocs;
+            guidelines: GuidelinesDocs;
             projectDocs?: Record<string, string>;
         },
         options: BuilderOptions = {}
@@ -211,7 +221,7 @@ export class SpecBuilder {
      */
     private async buildFullContext(
         task: Task,
-        baseContext: { requirements: string; design: string; steering: SteeringDocs; projectDocs?: Record<string, string> },
+        baseContext: { requirements: string; design: string; guidelines: GuidelinesDocs; projectDocs?: Record<string, string> },
         options: BuilderOptions
     ): Promise<ImplementationContext> {
         const context: ImplementationContext = { ...baseContext };
@@ -378,8 +388,81 @@ export class SpecBuilder {
         return parts.join('\n');
     }
 
-    private getSystemPrompt(task: Task): string {
-        const basePrompt = `You are a precise code implementation assistant. You implement exactly what is specified in the task, following the design and requirements provided.
+    /**
+     * Cache for the loaded skill content to avoid repeated file reads.
+     */
+    private cachedSkillContent: string | null = null;
+
+    /**
+     * Get the system prompt for task implementation.
+     * Reads from the skill file if available, otherwise uses bundled template.
+     */
+    private async getSystemPrompt(task: Task): Promise<string> {
+        // Try to load skill from workspace first
+        let skillContent = this.cachedSkillContent;
+
+        if (skillContent === null) {
+            try {
+                if (await this.deps.fileSystem.exists(TASK_IMPLEMENTER_SKILL_PATH)) {
+                    skillContent = await this.deps.fileSystem.readFile(TASK_IMPLEMENTER_SKILL_PATH);
+                    this.cachedSkillContent = skillContent;
+                }
+            } catch {
+                // Fall through to use bundled template
+            }
+        }
+
+        // Fall back to bundled template if skill file not found
+        if (!skillContent) {
+            try {
+                skillContent = loadAgentSkillTemplateByType('taskImplementer');
+                this.cachedSkillContent = skillContent;
+            } catch {
+                // Use hardcoded fallback if template loading fails
+                skillContent = this.getFallbackSystemPrompt();
+            }
+        }
+
+        // Add task-type specific instructions
+        let additionalInstructions = '';
+
+        if (task.type === 'test') {
+            additionalInstructions = `
+
+## Special Instructions for Test Tasks
+
+- Write comprehensive test cases covering happy path and edge cases
+- Follow the project's test patterns and frameworks
+- Include descriptive test names
+- Mock external dependencies appropriately`;
+        } else if (task.type === 'refactor') {
+            additionalInstructions = `
+
+## Special Instructions for Refactor Tasks
+
+- Preserve existing behavior exactly
+- Improve code structure, readability, or performance
+- Ensure all existing tests still pass
+- Document any significant structural changes`;
+        } else if (task.type === 'document') {
+            additionalInstructions = `
+
+## Special Instructions for Documentation Tasks
+
+- Write clear, comprehensive documentation
+- Include code examples where appropriate
+- Follow the project's documentation style
+- Cover both usage and API reference`;
+        }
+
+        return skillContent + additionalInstructions;
+    }
+
+    /**
+     * Fallback system prompt when skill file and template are unavailable.
+     */
+    private getFallbackSystemPrompt(): string {
+        return `You are a precise code implementation assistant. You implement exactly what is specified in the task, following the design and requirements provided.
 
 Rules:
 1. Follow the design exactly - do not add features not specified
@@ -387,39 +470,6 @@ Rules:
 3. Include necessary imports and type annotations
 4. Follow the project's coding conventions
 5. Output complete file contents when modifying files`;
-
-        // Add task-type specific instructions
-        if (task.type === 'test') {
-            return basePrompt + `
-
-Special Instructions for Test Tasks:
-- Write comprehensive test cases covering happy path and edge cases
-- Follow the project's test patterns and frameworks
-- Include descriptive test names
-- Mock external dependencies appropriately`;
-        }
-
-        if (task.type === 'refactor') {
-            return basePrompt + `
-
-Special Instructions for Refactor Tasks:
-- Preserve existing behavior exactly
-- Improve code structure, readability, or performance
-- Ensure all existing tests still pass
-- Document any significant structural changes`;
-        }
-
-        if (task.type === 'document') {
-            return basePrompt + `
-
-Special Instructions for Documentation Tasks:
-- Write clear, comprehensive documentation
-- Include code examples where appropriate
-- Follow the project's documentation style
-- Cover both usage and API reference`;
-        }
-
-        return basePrompt;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
